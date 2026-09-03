@@ -600,6 +600,11 @@ const TITLE_TO_GROUP_INDEX = {
 const VOWEL_COLOR = 'bg-orange-100 hover:bg-orange-200 text-orange-900 border-orange-300';
 
 export default function App() {
+  // ── Teacher mode — opened via TutoringApp's "Other Apps" panel, which
+  // appends ?teacher=true. No student ID needed; skips straight past the
+  // name modal into a teacher view. ──
+  const [isTeacherMode] = useState(() => new URLSearchParams(window.location.search).get('teacher') === 'true');
+
   // ── Student identity / Tutoring link / trophies ──
   const [userId, setUserId] = useState(null);
   const [studentName, setStudentName] = useState(() => localStorage.getItem('myanmarReaderStudentName') || '');
@@ -609,8 +614,10 @@ export default function App() {
   const [linkIdError, setLinkIdError] = useState('');
   const [nameInput, setNameInput] = useState('');
   const [trophyCount, setTrophyCount] = useState(0);
-  const [completedChapterNums, setCompletedChapterNums] = useState(new Set());
-  const [onlineCount, setOnlineCount] = useState(null); // null = not loaded yet
+  // Set of "chapterNum_sheetName" keys already completed (score reached 700+)
+  const [completedChapterSheets, setCompletedChapterSheets] = useState(new Set());
+  const [onlineStudents, setOnlineStudents] = useState([]); // full roster docs, for the shared panel below
+  const [showOnlinePanel, setShowOnlinePanel] = useState(false);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
@@ -621,10 +628,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isTeacherMode) return; // teacher never needs the student name modal
     if (userId && !studentName) setShowNameModal(true);
-  }, [userId, studentName]);
+  }, [userId, studentName, isTeacherMode]);
 
   const readerRosterDocRef = (name) => doc(db, READER_ROSTER_PATH, sanitizeReaderKey(name));
+  const chapterSheetKey = (chapterNum, sheetName) => `${chapterNum}_${sheetName}`;
 
   const finishNameSetup = (name, extra = {}) => {
     const trimmed = name.trim();
@@ -656,8 +665,9 @@ export default function App() {
 
   // Presence ping — every 60s while the tab is open, mark online with a
   // fresh lastSeen; mark offline on close so "who's online" stays accurate.
+  // Teacher sessions never write a roster doc (nothing to track for them).
   useEffect(() => {
-    if (!studentName || !userId) return;
+    if (isTeacherMode || !studentName || !userId) return;
     const ping = () => updateDoc(readerRosterDocRef(studentName), {
       isOnline: true, lastPing: serverTimestamp(), lastSeen: serverTimestamp(), userId
     }).catch(() => setDoc(readerRosterDocRef(studentName), {
@@ -669,39 +679,55 @@ export default function App() {
     const goOffline = () => { updateDoc(readerRosterDocRef(studentName), { isOnline: false, lastSeen: serverTimestamp() }).catch(() => {}); };
     window.addEventListener('beforeunload', goOffline);
     return () => { clearInterval(interval); goOffline(); window.removeEventListener('beforeunload', goOffline); };
-  }, [studentName, userId]);
+  }, [studentName, userId, isTeacherMode]);
 
-  // Live count of currently-online students, for the small "🟢 X online" badge.
+  // Full live roster — same data feeds both the teacher's view and every
+  // student's own "who else is online" panel, so they see identical info.
   useEffect(() => {
     const unsub = onSnapshot(collection(db, READER_ROSTER_PATH), (snap) => {
-      setOnlineCount(snap.docs.filter(d => d.data().isOnline).length);
+      setOnlineStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.isOnline?1:0)-(a.isOnline?1:0) || (a.studentName||'').localeCompare(b.studentName||'')));
     }, e => console.error('Roster listen error:', e));
     return () => unsub();
   }, []);
+  const onlineCount = onlineStudents.filter(s => s.isOnline).length;
 
-  // Load this student's own trophy/completed-chapter totals so the counter
-  // and "already awarded" checks survive a page reload.
+  // Load this student's own trophy/completed totals so the counter and
+  // "already awarded" checks survive a page reload. Each completed
+  // (chapter, sheet) pair — reaching score >= 700 — is one trophy.
   useEffect(() => {
     if (!studentName) return;
     const unsub = onSnapshot(query(collection(db, READER_SCORES_PATH), where('studentName', '==', studentName)), (snap) => {
-      const chapters = new Set();
-      snap.docs.forEach(d => { const c = d.data().chapterNum; if (c != null) chapters.add(c); });
-      setCompletedChapterNums(chapters);
-      setTrophyCount(chapters.size);
+      const done = new Set();
+      snap.docs.forEach(d => {
+        const dt = d.data();
+        if (dt.chapterNum != null && dt.sheetName && dt.isComplete) done.add(chapterSheetKey(dt.chapterNum, dt.sheetName));
+      });
+      setCompletedChapterSheets(done);
+      setTrophyCount(done.size);
     }, e => console.error('Scores listen error:', e));
     return () => unsub();
   }, [studentName]);
 
-  // Called once a chapter's last sentence has been reached — awards exactly
-  // one trophy per chapter, the first time only (re-finishing a chapter later
-  // doesn't stack more trophies).
-  const awardChapterCompletion = (chapterNum) => {
-    if (!studentName || chapterNum == null || completedChapterNums.has(chapterNum)) return;
-    const scoreId = `${sanitizeReaderKey(studentName)}_ch${chapterNum}`;
+  // Keeps this student's live score for the CURRENT chapter+sheet written to
+  // Firestore as they read, so the online panel can show "reading Chapter 3
+  // (Sheet A) — Score 450" in real time — and flips isComplete once the score
+  // crosses 700 (this app's existing 0–1000 read-aloud scoring, unchanged;
+  // only the persistence + completion threshold are new).
+  const persistChapterScore = (chapterNum, sheetName, currentScore) => {
+    if (!studentName || chapterNum == null || !sheetName) return;
+    const isComplete = currentScore >= 700;
+    const scoreId = `${sanitizeReaderKey(studentName)}_ch${chapterNum}_${sheetName}`;
     setDoc(doc(db, READER_SCORES_PATH, scoreId), {
-      studentName, name: studentName, userId, chapterNum,
-      completedAt: serverTimestamp(), timestamp: serverTimestamp()
-    }, { merge: true }).catch(e => console.error('Award chapter error:', e));
+      studentName, name: studentName, userId, chapterNum, sheetName,
+      score: Math.round(currentScore), isComplete,
+      ...(isComplete ? { completedAt: serverTimestamp() } : {}),
+      timestamp: serverTimestamp()
+    }, { merge: true }).catch(e => console.error('Persist chapter score error:', e));
+    // Mirror the same "what are they doing right now" info onto the roster
+    // doc, since that's what the online panel actually reads from.
+    updateDoc(readerRosterDocRef(studentName), {
+      currentChapter: chapterNum, currentSheet: sheetName, currentScore: Math.round(currentScore)
+    }).catch(() => {});
   };
 
   const [appMode, setAppMode] = useState('free'); 
@@ -760,6 +786,19 @@ const [sheetACurrentIndex, setSheetACurrentIndex] = useState(-1);
 const [sheetBAudio] = useState(new Audio());
   const [sheetBQAPairs, setSheetBQAPairs] = useState([]);
   const [selectedColumn, setSelectedColumn] = useState('');
+
+  // Keep this student's current chapter+sheet+score written to Firestore as
+  // they read, live — not just at the end. Debounced by 1.5s so a burst of
+  // per-sentence score updates while reading doesn't spam Firestore writes;
+  // still ends up current within a couple seconds either way, and
+  // persistChapterScore itself decides when score >= 700 flips isComplete.
+  useEffect(() => {
+    if (isTeacherMode || appMode !== 'sheet' || !selectedColumn || !studentName) return;
+    const chapterNum = getColumnIndex(selectedColumn);
+    const t = setTimeout(() => persistChapterScore(chapterNum, currentSheetName, score), 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [score, selectedColumn, currentSheetName, studentName, appMode]);
 
   const [currentlyPlayingItem, setCurrentlyPlayingItem] = useState(null); 
   const [currentLessonIndex, setCurrentLessonIndex] = useState(-1);
@@ -1584,7 +1623,6 @@ setShowTranslation(true);
     setSheetBLineIndex(lineIdx);
 }
       } else {
-          if (selectedColumn) awardChapterCompletion(getColumnIndex(selectedColumn));
           alert('All sentences have been displayed. (End of data)');
       }
   };
@@ -2515,12 +2553,51 @@ useEffect(() => {
         </div>
       )}
 
-      {/* Student info bar */}
-      {studentName && (
+      {/* Online Students panel — same view for teacher and every student */}
+      {showOnlinePanel && (
+        <div className="fixed inset-0 z-[9950] bg-black/40 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowOnlinePanel(false)}>
+          <div className="bg-white rounded-3xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-y-auto p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold text-gray-800">📚 Students {onlineCount > 0 && <span className="text-emerald-600">({onlineCount} online)</span>}</h2>
+              <button onClick={() => setShowOnlinePanel(false)} className="text-gray-400 hover:text-gray-700"><X size={22}/></button>
+            </div>
+            <div className="space-y-2">
+              {onlineStudents.map(s => (
+                <div key={s.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl border border-gray-100">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${s.isOnline ? 'bg-emerald-500' : 'bg-gray-300'}`}></span>
+                    <span className="font-bold text-gray-800">{s.studentName || s.name}</span>
+                  </div>
+                  <div className="text-right text-sm">
+                    {s.currentChapter != null ? (
+                      <span className="text-gray-600">{SHEET_CHAPTER_PREFIX} {s.currentChapter} ({s.currentSheet}) · <span className="font-bold text-amber-600">{s.currentScore ?? 0}</span></span>
+                    ) : (
+                      <span className="text-gray-400 italic">Not reading</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {onlineStudents.length === 0 && <p className="text-center text-gray-400 py-6">No students yet.</p>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Header bar — teacher mode has no name of its own to show */}
+      {isTeacherMode ? (
+        <div className="fixed top-2 right-2 z-[9800] flex items-center gap-2 bg-white/90 backdrop-blur-sm px-3 py-2 rounded-2xl shadow-lg border border-gray-200 text-sm">
+          <span className="font-bold text-indigo-600">👩‍🏫 Teacher</span>
+          <button onClick={() => setShowOnlinePanel(true)} className="flex items-center gap-1 text-emerald-600 font-bold hover:underline">
+            <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block"></span>{onlineCount} online
+          </button>
+        </div>
+      ) : studentName && (
         <div className="fixed top-2 right-2 z-[9800] flex items-center gap-2 bg-white/90 backdrop-blur-sm px-3 py-2 rounded-2xl shadow-lg border border-gray-200 text-sm">
           <span className="font-bold text-gray-700">{studentName}</span>
           <span className="flex items-center gap-1 text-amber-600 font-bold"><span>🏆</span>{trophyCount}</span>
-          {onlineCount != null && <span className="flex items-center gap-1 text-emerald-600 font-bold"><span className="w-2 h-2 bg-emerald-500 rounded-full inline-block"></span>{onlineCount} online</span>}
+          <button onClick={() => setShowOnlinePanel(true)} className="flex items-center gap-1 text-emerald-600 font-bold hover:underline">
+            <span className="w-2 h-2 bg-emerald-500 rounded-full inline-block"></span>{onlineCount} online
+          </button>
         </div>
       )}
 
