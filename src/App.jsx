@@ -618,6 +618,7 @@ export default function App() {
   const [completedChapterSheets, setCompletedChapterSheets] = useState(new Set());
   const [onlineStudents, setOnlineStudents] = useState([]); // full roster docs, for the shared panel below
   const [showOnlinePanel, setShowOnlinePanel] = useState(false);
+  const [alreadyCompletedInfo, setAlreadyCompletedInfo] = useState(null); // {chapterNum, sheetName} | null
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
@@ -724,10 +725,14 @@ export default function App() {
       timestamp: serverTimestamp()
     }, { merge: true }).catch(e => console.error('Persist chapter score error:', e));
     // Mirror the same "what are they doing right now" info onto the roster
-    // doc, since that's what the online panel actually reads from.
-    updateDoc(readerRosterDocRef(studentName), {
+    // doc, since that's what the online panel actually reads from. setDoc
+    // with merge (not updateDoc) so this can never fail just because the
+    // roster doc happens not to exist yet — updateDoc throwing here was
+    // exactly the kind of silent failure that caused the ping bug in
+    // AbhidhammaApp; better to just always succeed.
+    setDoc(readerRosterDocRef(studentName), {
       currentChapter: chapterNum, currentSheet: sheetName, currentScore: Math.round(currentScore)
-    }).catch(() => {});
+    }, { merge: true }).catch(e => console.error('Persist current-reading error:', e));
   };
 
   const [appMode, setAppMode] = useState('free'); 
@@ -1462,6 +1467,17 @@ for (let i = 1; i < namesArray.length; i++) {
               setAppMode('sheet');
               setCurrentSheetName(sheetNameParam);
               setSelectedColumn(column);
+              // Let a returning student know they already finished this
+              // chapter+sheet before, without stopping them from re-reading
+              // it — the banner is dismissible and doesn't block anything.
+              {
+                const chNum = getColumnIndex(column);
+                setAlreadyCompletedInfo(
+                  completedChapterSheets.has(chapterSheetKey(chNum, sheetNameParam))
+                    ? { chapterNum: chNum, sheetName: sheetNameParam }
+                    : null
+                );
+              }
               if (sheetNameParam === 'B' && SHEET_B_CHAPTERS[column]) {
     const chapterData = SHEET_B_CHAPTERS[column];
     const lines = formattedData.slice(1).map(d => d.mm);
@@ -2580,6 +2596,14 @@ useEffect(() => {
               {onlineStudents.length === 0 && <p className="text-center text-gray-400 py-6">No students yet.</p>}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* "You already completed this" notice — dismissible, doesn't block re-reading */}
+      {alreadyCompletedInfo && (
+        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[9850] bg-emerald-50 border-2 border-emerald-300 text-emerald-800 px-5 py-2.5 rounded-2xl shadow-lg flex items-center gap-3 text-sm font-bold max-w-[90vw]">
+          <span>✅ You completed {SHEET_CHAPTER_PREFIX} {alreadyCompletedInfo.chapterNum} / Sheet {alreadyCompletedInfo.sheetName}. Feel free to study it again!</span>
+          <button onClick={() => setAlreadyCompletedInfo(null)} className="text-emerald-500 hover:text-emerald-800 flex-shrink-0"><X size={18}/></button>
         </div>
       )}
 
