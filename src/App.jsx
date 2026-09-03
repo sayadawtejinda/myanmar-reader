@@ -1,5 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Play, Volume2, Delete, RotateCcw, BookOpen, DownloadCloud, FileText, Library, Settings, X, Plus, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { collection, doc, getDoc, getDocs, setDoc, updateDoc, onSnapshot, query, where, serverTimestamp } from 'firebase/firestore';
+import { auth, db, MYANMAR_READER_APP_ID } from './firebase';
+
+// ── TutoringApp integration ──────────────────────────────────────────────
+// Students link once (by entering their Tutoring Student ID), which pulls in
+// their exact TutoringApp name — matching the same pattern used by
+// Dhammaschool. From then on this app knows who's reading, tracks who's
+// currently online, and gives a trophy for every chapter finished, so
+// TutoringApp's reports can eventually pull this data in too.
+const TUTORING_APP_ID = 'dhamma-tutoring-app';
+const TUTORING_STUDENTS_PATH = `artifacts/${TUTORING_APP_ID}/public/data/students`;
+const READER_ROSTER_PATH = `artifacts/${MYANMAR_READER_APP_ID}/public/data/roster`;
+const READER_SCORES_PATH = `artifacts/${MYANMAR_READER_APP_ID}/public/data/scores`;
+const sanitizeReaderKey = (key) => (key || 'unknown').replace(/[.$#/\[\]]/g, '_');
 
 // --- DATA STRUCTURES ---
 
@@ -585,6 +600,110 @@ const TITLE_TO_GROUP_INDEX = {
 const VOWEL_COLOR = 'bg-orange-100 hover:bg-orange-200 text-orange-900 border-orange-300';
 
 export default function App() {
+  // ── Student identity / Tutoring link / trophies ──
+  const [userId, setUserId] = useState(null);
+  const [studentName, setStudentName] = useState(() => localStorage.getItem('myanmarReaderStudentName') || '');
+  const [showNameModal, setShowNameModal] = useState(false);
+  const [linkIdInput, setLinkIdInput] = useState('');
+  const [linkIdPanelOpen, setLinkIdPanelOpen] = useState(false);
+  const [linkIdError, setLinkIdError] = useState('');
+  const [nameInput, setNameInput] = useState('');
+  const [trophyCount, setTrophyCount] = useState(0);
+  const [completedChapterNums, setCompletedChapterNums] = useState(new Set());
+  const [onlineCount, setOnlineCount] = useState(null); // null = not loaded yet
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (user) => {
+      if (user) setUserId(user.uid);
+      else signInAnonymously(auth).catch(e => console.error('Auth error:', e));
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (userId && !studentName) setShowNameModal(true);
+  }, [userId, studentName]);
+
+  const readerRosterDocRef = (name) => doc(db, READER_ROSTER_PATH, sanitizeReaderKey(name));
+
+  const finishNameSetup = (name, extra = {}) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setStudentName(trimmed);
+    localStorage.setItem('myanmarReaderStudentName', trimmed);
+    setShowNameModal(false);
+    setDoc(readerRosterDocRef(trimmed), {
+      studentName: trimmed, name: trimmed, userId,
+      isOnline: true, lastPing: serverTimestamp(), lastSeen: serverTimestamp(),
+      joinedAt: Date.now(), ...extra
+    }, { merge: true }).catch(e => console.error('Roster create error:', e));
+  };
+
+  const handleLinkByStudentId = async () => {
+    const enteredId = linkIdInput.trim();
+    setLinkIdError('');
+    if (!enteredId) return;
+    try {
+      const snap = await getDocs(query(collection(db, TUTORING_STUDENTS_PATH), where('displayId', '==', enteredId)));
+      if (snap.empty) { setLinkIdError('Student ID not found. Please check with your teacher.'); return; }
+      const tutoringDoc = snap.docs[0];
+      finishNameSetup(tutoringDoc.data().name, { linkedToTutoring: true, tutoringStudentUid: tutoringDoc.id });
+    } catch (e) {
+      console.error('Error looking up Tutoring student:', e);
+      setLinkIdError('Could not check that ID right now. Please try again.');
+    }
+  };
+
+  // Presence ping — every 60s while the tab is open, mark online with a
+  // fresh lastSeen; mark offline on close so "who's online" stays accurate.
+  useEffect(() => {
+    if (!studentName || !userId) return;
+    const ping = () => updateDoc(readerRosterDocRef(studentName), {
+      isOnline: true, lastPing: serverTimestamp(), lastSeen: serverTimestamp(), userId
+    }).catch(() => setDoc(readerRosterDocRef(studentName), {
+      studentName, name: studentName, userId, isOnline: true,
+      lastPing: serverTimestamp(), lastSeen: serverTimestamp(), joinedAt: Date.now()
+    }, { merge: true }).catch(e => console.error('Ping create error:', e)));
+    ping();
+    const interval = setInterval(ping, 60000);
+    const goOffline = () => { updateDoc(readerRosterDocRef(studentName), { isOnline: false, lastSeen: serverTimestamp() }).catch(() => {}); };
+    window.addEventListener('beforeunload', goOffline);
+    return () => { clearInterval(interval); goOffline(); window.removeEventListener('beforeunload', goOffline); };
+  }, [studentName, userId]);
+
+  // Live count of currently-online students, for the small "🟢 X online" badge.
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, READER_ROSTER_PATH), (snap) => {
+      setOnlineCount(snap.docs.filter(d => d.data().isOnline).length);
+    }, e => console.error('Roster listen error:', e));
+    return () => unsub();
+  }, []);
+
+  // Load this student's own trophy/completed-chapter totals so the counter
+  // and "already awarded" checks survive a page reload.
+  useEffect(() => {
+    if (!studentName) return;
+    const unsub = onSnapshot(query(collection(db, READER_SCORES_PATH), where('studentName', '==', studentName)), (snap) => {
+      const chapters = new Set();
+      snap.docs.forEach(d => { const c = d.data().chapterNum; if (c != null) chapters.add(c); });
+      setCompletedChapterNums(chapters);
+      setTrophyCount(chapters.size);
+    }, e => console.error('Scores listen error:', e));
+    return () => unsub();
+  }, [studentName]);
+
+  // Called once a chapter's last sentence has been reached — awards exactly
+  // one trophy per chapter, the first time only (re-finishing a chapter later
+  // doesn't stack more trophies).
+  const awardChapterCompletion = (chapterNum) => {
+    if (!studentName || chapterNum == null || completedChapterNums.has(chapterNum)) return;
+    const scoreId = `${sanitizeReaderKey(studentName)}_ch${chapterNum}`;
+    setDoc(doc(db, READER_SCORES_PATH, scoreId), {
+      studentName, name: studentName, userId, chapterNum,
+      completedAt: serverTimestamp(), timestamp: serverTimestamp()
+    }, { merge: true }).catch(e => console.error('Award chapter error:', e));
+  };
+
   const [appMode, setAppMode] = useState('free'); 
   const [syllables, setSyllables] = useState([]);
   const [currentKeys, setCurrentKeys] = useState([]);
@@ -1465,6 +1584,7 @@ setShowTranslation(true);
     setSheetBLineIndex(lineIdx);
 }
       } else {
+          if (selectedColumn) awardChapterCompletion(getColumnIndex(selectedColumn));
           alert('All sentences have been displayed. (End of data)');
       }
   };
@@ -2352,6 +2472,57 @@ useEffect(() => {
 
   return (
     <div className="min-h-screen bg-gray-50 p-4 md:p-8 font-sans pb-24 relative">
+
+      {/* Name / Link-to-Tutoring modal — shown once, first visit only */}
+      {showNameModal && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-sm px-4">
+          <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md text-center border-4 border-emerald-100">
+            <div className="text-5xl mb-3">📖</div>
+            <h2 className="text-2xl font-bold text-gray-800 mb-1">Welcome!</h2>
+            <p className="text-gray-500 mb-6">Enter your name to start reading.</p>
+            <input
+              type="text" value={nameInput} onChange={e => setNameInput(e.target.value)}
+              placeholder="Your Name" autoFocus
+              onKeyDown={e => e.key === 'Enter' && finishNameSetup(nameInput)}
+              className="w-full p-3 border-2 border-gray-200 rounded-xl text-center text-lg font-bold mb-3 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+            />
+            <button onClick={() => finishNameSetup(nameInput)} disabled={!nameInput.trim()}
+              className="w-full bg-emerald-500 hover:bg-emerald-600 disabled:opacity-40 text-white font-bold py-3 rounded-xl shadow-md">
+              Start Reading
+            </button>
+
+            <div className="mt-5 pt-5 border-t-2 border-gray-100">
+              <button onClick={() => setLinkIdPanelOpen(v => !v)} className="text-sm font-bold text-indigo-600 hover:text-indigo-800 hover:underline">
+                🔗 Already on Tutoring? Enter your Student ID instead
+              </button>
+              {linkIdPanelOpen && (
+                <div className="mt-3">
+                  <p className="text-xs text-gray-500 mb-2">Links your name permanently, so your progress always matches your Tutoring account.</p>
+                  <input
+                    type="text" inputMode="numeric" value={linkIdInput} onChange={e => setLinkIdInput(e.target.value)}
+                    placeholder="Your Tutoring Student ID"
+                    onKeyDown={e => e.key === 'Enter' && handleLinkByStudentId()}
+                    className="w-full p-2.5 border-2 border-indigo-200 rounded-xl text-center font-bold mb-2 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                  />
+                  <button onClick={handleLinkByStudentId} className="w-full bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-2.5 rounded-xl">
+                    Link My Account
+                  </button>
+                  {linkIdError && <p className="text-red-500 text-sm font-bold mt-2">{linkIdError}</p>}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Student info bar */}
+      {studentName && (
+        <div className="fixed top-2 right-2 z-[9800] flex items-center gap-2 bg-white/90 backdrop-blur-sm px-3 py-2 rounded-2xl shadow-lg border border-gray-200 text-sm">
+          <span className="font-bold text-gray-700">{studentName}</span>
+          <span className="flex items-center gap-1 text-amber-600 font-bold"><span>🏆</span>{trophyCount}</span>
+          {onlineCount != null && <span className="flex items-center gap-1 text-emerald-600 font-bold"><span className="w-2 h-2 bg-emerald-500 rounded-full inline-block"></span>{onlineCount} online</span>}
+        </div>
+      )}
 
       {/* Floating Score Box */}
       {appMode === 'sheet' && sheetData.length > 0 && (
