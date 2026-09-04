@@ -616,6 +616,9 @@ export default function App() {
   const [trophyCount, setTrophyCount] = useState(0);
   // Set of "chapterNum_sheetName" keys already completed (score reached 700+)
   const [completedChapterSheets, setCompletedChapterSheets] = useState(new Set());
+  const [completedFullChapters, setCompletedFullChapters] = useState(new Set()); // chapter numbers where BOTH sheets are done
+  const [resumePosition, setResumePosition] = useState(null); // {chapterNum, sheetName} — furthest point reached
+  const [showGoToSheetBPrompt, setShowGoToSheetBPrompt] = useState(null); // chapterNum, or null
   const [onlineStudents, setOnlineStudents] = useState([]); // full roster docs, for the shared panel below
   const [showOnlinePanel, setShowOnlinePanel] = useState(false);
   const [alreadyCompletedInfo, setAlreadyCompletedInfo] = useState(null); // {chapterNum, sheetName} | null
@@ -693,19 +696,42 @@ export default function App() {
   const onlineCount = onlineStudents.filter(s => s.isOnline).length;
 
   // Load this student's own trophy/completed totals so the counter and
-  // "already awarded" checks survive a page reload. Each completed
-  // (chapter, sheet) pair — reaching score >= 700 — is one trophy.
+  // "already awarded" checks survive a page reload. A chapter only really
+  // counts as finished once BOTH its sheets reach 700+ — Sheet A alone isn't
+  // "the chapter is done" yet, it's worth 0 trophies until Sheet B follows,
+  // at which point both sheets become worth 1 trophy each (2 total) at once.
   useEffect(() => {
     if (!studentName) return;
     const unsub = onSnapshot(query(collection(db, READER_SCORES_PATH), where('studentName', '==', studentName)), (snap) => {
-      const done = new Set();
+      const sheetDone = new Set();       // "chapterNum_sheetName" reaching 700+
+      const byChapter = {};              // chapterNum -> { A: bool, B: bool }
       snap.docs.forEach(d => {
         const dt = d.data();
-        if (dt.chapterNum != null && dt.sheetName && dt.isComplete) done.add(chapterSheetKey(dt.chapterNum, dt.sheetName));
+        if (dt.chapterNum == null || !dt.sheetName) return;
+        if (dt.isComplete) sheetDone.add(chapterSheetKey(dt.chapterNum, dt.sheetName));
+        byChapter[dt.chapterNum] = byChapter[dt.chapterNum] || {};
+        byChapter[dt.chapterNum][dt.sheetName] = !!dt.isComplete;
       });
-      setCompletedChapterSheets(done);
-      setTrophyCount(done.size);
+      const fullChapters = new Set(
+        Object.entries(byChapter).filter(([, s]) => s.A && s.B).map(([ch]) => parseInt(ch))
+      );
+      setCompletedChapterSheets(sheetDone);
+      setCompletedFullChapters(fullChapters);
+      setTrophyCount(fullChapters.size * 2); // 2 trophies per fully-finished chapter (1 per sheet)
     }, e => console.error('Scores listen error:', e));
+    return () => unsub();
+  }, [studentName]);
+
+  // Where this student should pick up next time — furthest (chapter, sheet)
+  // reached so far, following the fixed order: Ch1/A, Ch1/B, Ch2/A, Ch2/B, ...
+  useEffect(() => {
+    if (!studentName) return;
+    const unsub = onSnapshot(readerRosterDocRef(studentName), (snap) => {
+      if (snap.exists()) {
+        const dt = snap.data();
+        if (dt.furthestChapter != null) setResumePosition({ chapterNum: dt.furthestChapter, sheetName: dt.furthestSheet || 'A' });
+      }
+    }, e => console.error('Resume position listen error:', e));
     return () => unsub();
   }, [studentName]);
 
@@ -714,16 +740,52 @@ export default function App() {
   // (Sheet A) — Score 450" in real time — and flips isComplete once the score
   // crosses 700 (this app's existing 0–1000 read-aloud scoring, unchanged;
   // only the persistence + completion threshold are new).
-  const persistChapterScore = (chapterNum, sheetName, currentScore) => {
+  const persistChapterScore = async (chapterNum, sheetName, currentScore) => {
     if (!studentName || chapterNum == null || !sheetName) return;
     const isComplete = currentScore >= 700;
     const scoreId = `${sanitizeReaderKey(studentName)}_ch${chapterNum}_${sheetName}`;
-    setDoc(doc(db, READER_SCORES_PATH, scoreId), {
+    const scoreRef = doc(db, READER_SCORES_PATH, scoreId);
+
+    // If this sheet just became complete, check its sibling sheet (the other
+    // of A/B for the same chapter) — if THAT one is also complete, the whole
+    // chapter is now done, so stamp chapterComplete:true on both sheet docs
+    // at once. This is what tells TutoringApp "these 2 sheets are now worth
+    // a trophy together" instead of one at a time.
+    let chapterComplete = false;
+    if (isComplete) {
+      const siblingSheet = sheetName === 'A' ? 'B' : 'A';
+      try {
+        const siblingId = `${sanitizeReaderKey(studentName)}_ch${chapterNum}_${siblingSheet}`;
+        const siblingSnap = await getDoc(doc(db, READER_SCORES_PATH, siblingId));
+        if (siblingSnap.exists() && siblingSnap.data().isComplete) {
+          chapterComplete = true;
+          await setDoc(doc(db, READER_SCORES_PATH, siblingId), { chapterComplete: true }, { merge: true });
+        }
+      } catch (e) { console.error('Sibling sheet check error:', e); }
+    }
+
+    setDoc(scoreRef, {
       studentName, name: studentName, userId, chapterNum, sheetName,
-      score: Math.round(currentScore), isComplete,
+      score: Math.round(currentScore), isComplete, chapterComplete,
       ...(isComplete ? { completedAt: serverTimestamp() } : {}),
       timestamp: serverTimestamp()
     }, { merge: true }).catch(e => console.error('Persist chapter score error:', e));
+
+    // Sequential guidance: nudge toward Sheet B right after Sheet A finishes,
+    // and remember the furthest point reached for the "resume here" prompt.
+    if (isComplete && sheetName === 'A') setShowGoToSheetBPrompt(chapterNum);
+    if (isComplete) {
+      const isFurther = !resumePosition
+        || chapterNum > resumePosition.chapterNum
+        || (chapterNum === resumePosition.chapterNum && sheetName === 'B' && resumePosition.sheetName === 'A');
+      if (isFurther) {
+        const nextChapterNum = (sheetName === 'B') ? Math.min(TOTAL_CHAPTERS, chapterNum + 1) : chapterNum;
+        const nextSheetName = (sheetName === 'B') ? 'A' : 'B';
+        setResumePosition({ chapterNum: nextChapterNum, sheetName: nextSheetName });
+        setDoc(readerRosterDocRef(studentName), { furthestChapter: nextChapterNum, furthestSheet: nextSheetName }, { merge: true }).catch(() => {});
+      }
+    }
+
     // Mirror the same "what are they doing right now" info onto the roster
     // doc, since that's what the online panel actually reads from. setDoc
     // with merge (not updateDoc) so this can never fail just because the
@@ -2604,6 +2666,34 @@ useEffect(() => {
         <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[9850] bg-emerald-50 border-2 border-emerald-300 text-emerald-800 px-5 py-2.5 rounded-2xl shadow-lg flex items-center gap-3 text-sm font-bold max-w-[90vw]">
           <span>✅ You completed {SHEET_CHAPTER_PREFIX} {alreadyCompletedInfo.chapterNum} / Sheet {alreadyCompletedInfo.sheetName}. Feel free to study it again!</span>
           <button onClick={() => setAlreadyCompletedInfo(null)} className="text-emerald-500 hover:text-emerald-800 flex-shrink-0"><X size={18}/></button>
+        </div>
+      )}
+
+      {/* Sequential nudge — right after Sheet A finishes, point at Sheet B for
+          the same chapter (the two sheets are a matched pair; the chapter
+          isn't "done" — and isn't worth any trophy — until both are). */}
+      {showGoToSheetBPrompt != null && (
+        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[9850] bg-indigo-50 border-2 border-indigo-300 text-indigo-800 px-5 py-2.5 rounded-2xl shadow-lg flex items-center gap-3 text-sm font-bold max-w-[90vw]">
+          <span>🎉 {SHEET_CHAPTER_PREFIX} {showGoToSheetBPrompt} Sheet A done! Now try Sheet B.</span>
+          <button
+            onClick={() => { fetchSheetData('B', getColumnName(showGoToSheetBPrompt - 1)); setShowGoToSheetBPrompt(null); }}
+            className="bg-indigo-500 hover:bg-indigo-600 text-white px-3 py-1 rounded-lg flex-shrink-0"
+          >Go to Sheet B</button>
+          <button onClick={() => setShowGoToSheetBPrompt(null)} className="text-indigo-500 hover:text-indigo-800 flex-shrink-0"><X size={18}/></button>
+        </div>
+      )}
+
+      {/* Resume prompt — shown once after the name is known and before any
+          chapter has been opened this session, pointing back to the furthest
+          (chapter, sheet) this student has reached. */}
+      {!isTeacherMode && studentName && resumePosition && !resumePosition._dismissed && appMode !== 'sheet' && (
+        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[9840] bg-amber-50 border-2 border-amber-300 text-amber-800 px-5 py-2.5 rounded-2xl shadow-lg flex items-center gap-3 text-sm font-bold max-w-[90vw]">
+          <span>📍 Continue where you left off: {SHEET_CHAPTER_PREFIX} {resumePosition.chapterNum} (Sheet {resumePosition.sheetName})?</span>
+          <button
+            onClick={() => fetchSheetData(resumePosition.sheetName, getColumnName(resumePosition.chapterNum - 1))}
+            className="bg-amber-500 hover:bg-amber-600 text-white px-3 py-1 rounded-lg flex-shrink-0"
+          >Continue</button>
+          <button onClick={() => setResumePosition(p => ({ ...p, _dismissed: true }))} className="text-amber-500 hover:text-amber-800 flex-shrink-0"><X size={18}/></button>
         </div>
       )}
 
