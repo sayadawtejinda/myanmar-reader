@@ -607,7 +607,21 @@ export default function App() {
 
   // ── Student identity / Tutoring link / trophies ──
   const [userId, setUserId] = useState(null);
-  const [studentName, setStudentName] = useState(() => localStorage.getItem('myanmarReaderStudentName') || '');
+  // TutoringApp always knows a student's real, current name — so whenever a
+  // ?student= param is present (arriving via "Start Lesson"), that always
+  // wins over whatever's cached in localStorage on this particular browser.
+  // This is what keeps "who's online, reading what" tied to the actual
+  // student, not to a specific device — the same student on a different
+  // computer, or after a rename, still shows up correctly.
+  const deepLinkStudentName = new URLSearchParams(window.location.search).get('student');
+  const [studentName, setStudentName] = useState(() => deepLinkStudentName || localStorage.getItem('myanmarReaderStudentName') || '');
+  useEffect(() => {
+    if (deepLinkStudentName && deepLinkStudentName !== studentName) {
+      localStorage.setItem('myanmarReaderStudentName', deepLinkStudentName);
+      setStudentName(deepLinkStudentName);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkStudentName]);
   const [showNameModal, setShowNameModal] = useState(false);
   const [linkIdInput, setLinkIdInput] = useState('');
   const [linkIdPanelOpen, setLinkIdPanelOpen] = useState(false);
@@ -622,6 +636,7 @@ export default function App() {
   const [onlineStudents, setOnlineStudents] = useState([]); // full roster docs, for the shared panel below
   const [showOnlinePanel, setShowOnlinePanel] = useState(false);
   const [alreadyCompletedInfo, setAlreadyCompletedInfo] = useState(null); // {chapterNum, sheetName} | null
+  const [nowForOnlineCheck, setNowForOnlineCheck] = useState(Date.now()); // ticks so "online" status expires live
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
@@ -632,9 +647,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (isTeacherMode) return; // teacher never needs the student name modal
+    if (isTeacherMode || deepLinkStudentName) return; // teacher, or a name already supplied by the link — never prompt
     if (userId && !studentName) setShowNameModal(true);
-  }, [userId, studentName, isTeacherMode]);
+  }, [userId, studentName, isTeacherMode, deepLinkStudentName]);
 
   const readerRosterDocRef = (name) => doc(db, READER_ROSTER_PATH, sanitizeReaderKey(name));
   const chapterSheetKey = (chapterNum, sheetName) => `${chapterNum}_${sheetName}`;
@@ -689,11 +704,43 @@ export default function App() {
   // student's own "who else is online" panel, so they see identical info.
   useEffect(() => {
     const unsub = onSnapshot(collection(db, READER_ROSTER_PATH), (snap) => {
-      setOnlineStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.isOnline?1:0)-(a.isOnline?1:0) || (a.studentName||'').localeCompare(b.studentName||'')));
+      setOnlineStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })));
     }, e => console.error('Roster listen error:', e));
     return () => unsub();
   }, []);
-  const onlineCount = onlineStudents.filter(s => s.isOnline).length;
+
+  // Ticks every 30s so "online" (last seen within 5 min) and the weekly
+  // roster view both stay current without needing a page reload — a closed
+  // tab / dead connection stops pinging, so this is what actually clears
+  // "online" instead of relying on beforeunload firing (unreliable on
+  // mobile browsers, which is why students used to appear stuck online).
+  useEffect(() => {
+    const interval = setInterval(() => setNowForOnlineCheck(Date.now()), 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const FIVE_MIN_MS = 5 * 60 * 1000;
+  const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+  const isRosterEntryOnline = (s) => {
+    const lastSeenMs = s.lastSeen?.toMillis ? s.lastSeen.toMillis() : (s.lastSeen?.seconds ? s.lastSeen.seconds * 1000 : 0);
+    return lastSeenMs > 0 && (nowForOnlineCheck - lastSeenMs) < FIVE_MIN_MS;
+  };
+  // The 📚 Students panel shows everyone active in the last week (so the
+  // teacher can see who's been around recently even if not online right
+  // now), sorted online-first, then most-recently-seen.
+  const weeklyRosterList = onlineStudents
+    .filter(s => {
+      const lastSeenMs = s.lastSeen?.toMillis ? s.lastSeen.toMillis() : (s.lastSeen?.seconds ? s.lastSeen.seconds * 1000 : 0);
+      return lastSeenMs > 0 && (nowForOnlineCheck - lastSeenMs) < ONE_WEEK_MS;
+    })
+    .map(s => ({ ...s, _isOnlineNow: isRosterEntryOnline(s) }))
+    .sort((a, b) => {
+      if (a._isOnlineNow !== b._isOnlineNow) return b._isOnlineNow ? 1 : -1;
+      const aMs = a.lastSeen?.toMillis ? a.lastSeen.toMillis() : 0;
+      const bMs = b.lastSeen?.toMillis ? b.lastSeen.toMillis() : 0;
+      return bMs - aMs;
+    });
+  const onlineCount = onlineStudents.filter(isRosterEntryOnline).length;
 
   // Load this student's own trophy/completed totals so the counter and
   // "already awarded" checks survive a page reload. A chapter only really
@@ -2639,11 +2686,12 @@ useEffect(() => {
               <h2 className="text-xl font-bold text-gray-800">📚 Students {onlineCount > 0 && <span className="text-emerald-600">({onlineCount} online)</span>}</h2>
               <button onClick={() => setShowOnlinePanel(false)} className="text-gray-400 hover:text-gray-700"><X size={22}/></button>
             </div>
+            <p className="text-xs text-gray-400 mb-3">Showing everyone active in the last 7 days.</p>
             <div className="space-y-2">
-              {onlineStudents.map(s => (
+              {weeklyRosterList.map(s => (
                 <div key={s.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl border border-gray-100">
                   <div className="flex items-center gap-2">
-                    <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${s.isOnline ? 'bg-emerald-500' : 'bg-gray-300'}`}></span>
+                    <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${s._isOnlineNow ? 'bg-emerald-500' : 'bg-gray-300'}`}></span>
                     <span className="font-bold text-gray-800">{s.studentName || s.name}</span>
                   </div>
                   <div className="text-right text-sm">
@@ -2655,7 +2703,7 @@ useEffect(() => {
                   </div>
                 </div>
               ))}
-              {onlineStudents.length === 0 && <p className="text-center text-gray-400 py-6">No students yet.</p>}
+              {weeklyRosterList.length === 0 && <p className="text-center text-gray-400 py-6">No students active this week yet.</p>}
             </div>
           </div>
         </div>
